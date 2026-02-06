@@ -175,3 +175,7 @@ required-features = ["bench"]
 [[bench]]
 name = "write_perf_benchmark"
 harness = false
+
+[[bench]]
+name = "parallel_write_benchmark"
+harness = false
