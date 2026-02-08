@@ -342,7 +342,7 @@ fn bench_writer_scalability(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
 
-    let writer_counts: &[usize] = &[1, 2, 4, 8, 16];
+    let writer_counts: &[usize] = &[1, 2, 4, 8, 12, 16];
     let num_batches = 5;
     let rows_per_batch = 10;
 
@@ -853,7 +853,7 @@ fn bench_write_burst(criterion: &mut Criterion) {
     let enable_rusqlite =
         std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err() && !cfg!(feature = "codspeed");
 
-    let writer_counts: &[usize] = &[4, 8, 16];
+    let writer_counts: &[usize] = &[4, 8, 12, 16];
     let rows_per_writer = 50;
 
     let mut group = criterion.benchmark_group("Write Burst");
