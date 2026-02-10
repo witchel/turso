@@ -124,6 +124,9 @@ pub use vdbe::{
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
 
+#[cfg(feature = "lock_metrics")]
+pub mod lock_metrics;
+
 pub(crate) mod sync;
 pub(crate) mod thread;
 

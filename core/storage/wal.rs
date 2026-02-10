@@ -701,6 +701,13 @@ impl fmt::Debug for OngoingCheckpoint {
     }
 }
 
+#[cfg(feature = "lock_metrics")]
+std::thread_local! {
+    /// Timestamp when the WAL write_lock was acquired (for hold-time measurement).
+    static WAL_LOCK_ACQUIRED_AT: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
 pub struct WalFile {
     io: Arc<dyn IO>,
     buffer_pool: Arc<BufferPool>,
@@ -1210,6 +1217,8 @@ impl Wal for WalFile {
                 "write lock already held by this connection"
             );
             if !shared.write_lock.write() {
+                #[cfg(feature = "lock_metrics")]
+                crate::lock_metrics::record_wal_write_lock_failure();
                 return Err(LimboError::Busy);
             }
             let db_changed = self.db_changed(shared);
@@ -1223,8 +1232,13 @@ impl Wal for WalFile {
                 return Err(LimboError::BusySnapshot);
             }
 
+            #[cfg(feature = "lock_metrics")]
+            crate::lock_metrics::record_wal_write_lock_acquire();
             Ok(())
         })?;
+        #[cfg(feature = "lock_metrics")]
+        WAL_LOCK_ACQUIRED_AT.with(|cell| cell.set(Some(std::time::Instant::now())));
+
         if self
             .write_lock_held
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1237,13 +1251,27 @@ impl Wal for WalFile {
             );
         }
 
+        #[cfg(feature = "lock_metrics")]
+        let io_start = std::time::Instant::now();
         let result = self.try_restart_log_before_write();
+        #[cfg(feature = "lock_metrics")]
+        crate::lock_metrics::record_wal_restart_io_ns(io_start.elapsed().as_nanos() as u64);
         if let Err(LimboError::Busy) | Ok(()) = &result {
             // it's fine if we were unable to restart WAL file due to Busy errors
             return Ok(());
         }
 
         // don't forget to release the write-lock if
+        #[cfg(feature = "lock_metrics")]
+        {
+            WAL_LOCK_ACQUIRED_AT.with(|cell| {
+                if let Some(acquired) = cell.take() {
+                    crate::lock_metrics::record_wal_write_lock_hold_ns(
+                        acquired.elapsed().as_nanos() as u64,
+                    );
+                }
+            });
+        }
         self.with_shared(|shared| {
             shared.write_lock.unlock();
         });
@@ -1261,6 +1289,16 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
         tracing::debug!("end_write_txn");
+        #[cfg(feature = "lock_metrics")]
+        {
+            WAL_LOCK_ACQUIRED_AT.with(|cell| {
+                if let Some(acquired) = cell.take() {
+                    crate::lock_metrics::record_wal_write_lock_hold_ns(
+                        acquired.elapsed().as_nanos() as u64,
+                    );
+                }
+            });
+        }
         turso_assert!(
             self.write_lock_held
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)

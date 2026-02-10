@@ -642,6 +642,286 @@ def plot_contention_overview(run_dirs):
 
 
 # ---------------------------------------------------------------------------
+# Plot 8: Lock Hold Time Breakdown (requires lock_metrics feature)
+# ---------------------------------------------------------------------------
+
+def read_lock_metrics(base_dir, group, bench_id, param):
+    """Read lock metrics from the sidecar JSON."""
+    retries_base = base_dir.replace("target/criterion", "target/bench_retries")
+    path = os.path.join(retries_base, group, bench_id, f"{param}_lock_metrics.json")
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
+
+
+def plot_lock_hold_breakdown(run_dirs):
+    """1x2 subplot: WAL lock breakdown (left), MVCC lock breakdown (right).
+
+    WAL panel shows 5-segment stacked bars: WAL header prepare, page reads,
+    frame pwritev, WAL fsync, and non-I/O (CPU/cache).
+    MVCC panel shows 3-segment bars: fsync, log I/O, and other.
+    """
+    group_name = "Disjoint Key Scalability"
+    writer_counts = [1, 2, 4, 6, 8, 10, 12]
+    multi = len(run_dirs) > 1
+    has_data = False
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # --- WAL panel (left): 5-segment breakdown ---
+    wal_prepare_means, wal_read_means, wal_write_means = [], [], []
+    wal_sync_means, wal_other_means = [], []
+    wal_counts = []
+
+    for w in writer_counts:
+        metrics_list = read_across_runs(run_dirs, group_name, "turso_wal", w, read_lock_metrics)
+        if not metrics_list:
+            continue
+        prepare_pa, read_pa, write_pa, sync_pa, other_pa = [], [], [], [], []
+        for m in metrics_list:
+            acq = m.get("wal_acquires", 0)
+            if acq == 0:
+                continue
+            hold = m.get("wal_hold_us", 0)
+            restart = m.get("wal_restart_io_us", 0)
+            prepare = m.get("wal_commit_prepare_us", 0)
+            read = m.get("wal_commit_read_us", 0)
+            write = m.get("wal_commit_write_us", 0)
+            sync = m.get("wal_commit_sync_us", 0)
+            # Also accept legacy field name for backwards compat
+            if restart == 0 and "wal_io_us" in m:
+                restart = m["wal_io_us"]
+            total_io = restart + prepare + read + write + sync
+            prepare_pa.append((restart + prepare) / acq)
+            read_pa.append(read / acq)
+            write_pa.append(write / acq)
+            sync_pa.append(sync / acq)
+            other_pa.append(max(0, (hold - total_io)) / acq)
+        if not prepare_pa:
+            continue
+        has_data = True
+        wal_prepare_means.append(np.mean(prepare_pa))
+        wal_read_means.append(np.mean(read_pa))
+        wal_write_means.append(np.mean(write_pa))
+        wal_sync_means.append(np.mean(sync_pa))
+        wal_other_means.append(np.mean(other_pa))
+        wal_counts.append(w)
+
+    if wal_counts:
+        x = np.arange(len(wal_counts))
+        width = 0.6
+        bottom = np.zeros(len(wal_counts))
+        ax1.bar(x, wal_other_means, width, bottom=bottom,
+                label="Non-I/O (CPU/cache)", color="#c8e6c9", alpha=0.85)
+        bottom = bottom + np.array(wal_other_means)
+        ax1.bar(x, wal_prepare_means, width, bottom=bottom,
+                label="WAL header (prepare)", color="#a5d6a7", alpha=0.85)
+        bottom = bottom + np.array(wal_prepare_means)
+        ax1.bar(x, wal_read_means, width, bottom=bottom,
+                label="Page reads", color="#66bb6a", alpha=0.85)
+        bottom = bottom + np.array(wal_read_means)
+        ax1.bar(x, wal_write_means, width, bottom=bottom,
+                label="Frame pwritev", color="#388e3c", alpha=0.85)
+        bottom = bottom + np.array(wal_write_means)
+        ax1.bar(x, wal_sync_means, width, bottom=bottom,
+                label="WAL fsync", color="#1b5e20", alpha=0.85)
+        ax1.set_xlabel("Number of Writers")
+        ax1.set_ylabel("\u00b5s per Lock Acquisition")
+        ax1.set_title("WAL write_lock Hold Time Breakdown")
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(wal_counts)
+        ax1.legend(fontsize=8)
+        ax1.grid(True, alpha=0.3, axis="y")
+
+    # --- MVCC panel (right): log_tx + sync only (residual is <1%, omitted) ---
+    mvcc_sync_means, mvcc_log_means = [], []
+    mvcc_counts = []
+
+    for w in writer_counts:
+        metrics_list = read_across_runs(run_dirs, group_name, "turso_mvcc", w, read_lock_metrics)
+        if not metrics_list:
+            continue
+        sync_per_acq = []
+        log_per_acq = []
+        for m in metrics_list:
+            acq = m.get("mvcc_acquires", 0)
+            if acq == 0:
+                continue
+            log = m.get("mvcc_log_us", 0)
+            sync = m.get("mvcc_sync_us", 0)
+            sync_per_acq.append(sync / acq)
+            log_per_acq.append(log / acq)
+        if not sync_per_acq:
+            continue
+        has_data = True
+        mvcc_sync_means.append(np.mean(sync_per_acq))
+        mvcc_log_means.append(np.mean(log_per_acq))
+        mvcc_counts.append(w)
+
+    if mvcc_counts:
+        x = np.arange(len(mvcc_counts))
+        width = 0.6
+        ax2.bar(x, mvcc_log_means, width,
+                label="log_tx() I/O", color="#e53935", alpha=0.85)
+        ax2.bar(x, mvcc_sync_means, width, bottom=mvcc_log_means,
+                label="sync() / fsync", color="#b71c1c", alpha=0.85)
+        ax2.set_xlabel("Number of Writers")
+        ax2.set_ylabel("\u00b5s per Lock Acquisition")
+        ax2.set_title("MVCC pager_commit_lock Hold Time Breakdown")
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(mvcc_counts)
+        ax2.legend(fontsize=9)
+        ax2.grid(True, alpha=0.3, axis="y")
+
+    if not has_data:
+        plt.close()
+        print("  Skipped lock_hold_breakdown.png (no lock metrics data)")
+        return
+
+    suffix = f" (mean of {len(run_dirs)} runs)" if multi else ""
+    fig.suptitle(f"Lock Hold Time Breakdown — Disjoint Key Workload{suffix}", fontsize=13, y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "lock_hold_breakdown.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved lock_hold_breakdown.png")
+
+
+# ---------------------------------------------------------------------------
+# Plot 9: Kernel Profile (syscall breakdown + thread states)
+# ---------------------------------------------------------------------------
+
+def plot_kernel_profile():
+    """Plot kernel profiling data from kernel_profile.json.
+
+    Generates up to two sub-plots:
+    - Syscall breakdown: horizontal stacked bars showing total time per syscall
+    - Thread states: per-state interval counts (if available)
+
+    Null-safe: skips gracefully when data is absent.
+    """
+    json_path = os.path.join("target", "bench_retries", "kernel_profile.json")
+    if not os.path.exists(json_path):
+        print("  Skipped kernel_profile.png (no kernel_profile.json)")
+        return
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    syscalls = data.get("syscalls")
+    thread_states = data.get("thread_states")
+    backend = data.get("backend", "unknown")
+    has_syscalls = isinstance(syscalls, dict) and len(syscalls) > 0
+    has_thread_states = isinstance(thread_states, dict) and len(thread_states) > 0
+
+    if not has_syscalls and not has_thread_states:
+        print(f"  Skipped kernel_profile.png (backend={backend}, no plottable data)")
+        return
+
+    num_panels = int(has_syscalls) + int(has_thread_states)
+    fig, axes = plt.subplots(1, num_panels, figsize=(7 * num_panels, 6))
+    if num_panels == 1:
+        axes = [axes]
+
+    panel_idx = 0
+
+    # ── Syscall breakdown bar chart ──
+    if has_syscalls:
+        ax = axes[panel_idx]
+        panel_idx += 1
+
+        # Sort syscalls by total_us descending
+        sorted_sc = sorted(syscalls.items(), key=lambda x: x[1].get("total_us", 0), reverse=True)
+
+        # Show top 15 syscalls to avoid clutter
+        top_n = 15
+        if len(sorted_sc) > top_n:
+            sorted_sc = sorted_sc[:top_n]
+
+        names = [sc[0] for sc in sorted_sc]
+        totals = [sc[1].get("total_us", 0) for sc in sorted_sc]
+        counts = [sc[1].get("count", 0) for sc in sorted_sc]
+        avgs = [sc[1].get("avg_us", 0) for sc in sorted_sc]
+
+        # Convert to ms for readability if values are large
+        max_total = max(totals) if totals else 0
+        if max_total > 10000:
+            totals_plot = [t / 1000.0 for t in totals]
+            unit = "ms"
+        else:
+            totals_plot = totals
+            unit = "\u00b5s"
+
+        y_pos = np.arange(len(names))
+        bars = ax.barh(y_pos, totals_plot, color="#4c6ef5", alpha=0.85)
+
+        # Annotate with count and avg
+        for i, (bar, count, avg) in enumerate(zip(bars, counts, avgs)):
+            w = bar.get_width()
+            label = f"n={count:,}  avg={avg:.1f}\u00b5s"
+            ax.text(w + max(totals_plot) * 0.02, bar.get_y() + bar.get_height() / 2,
+                    label, va='center', fontsize=7, color='#333')
+
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names, fontsize=8)
+        ax.invert_yaxis()
+        ax.set_xlabel(f"Total Time ({unit})")
+        ax.set_title(f"Syscall Time Breakdown ({backend})")
+        ax.grid(True, alpha=0.3, axis="x")
+
+    # ── Thread state chart ──
+    if has_thread_states:
+        ax = axes[panel_idx]
+        panel_idx += 1
+
+        # Thread states may have different formats depending on backend
+        state_keys = []
+        state_values = []
+
+        for key in ["running_intervals", "blocked_intervals", "preempted_intervals"]:
+            if key in thread_states:
+                label = key.replace("_intervals", "").capitalize()
+                state_keys.append(label)
+                state_values.append(thread_states[key])
+
+        # Also handle perf-style context_switches
+        if "context_switches" in thread_states and not state_keys:
+            state_keys.append("Context Switches")
+            state_values.append(thread_states["context_switches"])
+
+        if state_keys:
+            colors = ["#2ca02c", "#d62728", "#ff7f0e", "#1f77b4"]
+            bars = ax.bar(state_keys, state_values,
+                          color=colors[:len(state_keys)], alpha=0.85)
+
+            for bar, val in zip(bars, state_values):
+                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                        f"{val:,}", ha='center', va='bottom', fontsize=9)
+
+            ax.set_ylabel("Count")
+            ax.set_title(f"Thread State Intervals ({backend})")
+            ax.grid(True, alpha=0.3, axis="y")
+        else:
+            ax.text(0.5, 0.5, "No thread state data available",
+                    ha='center', va='center', transform=ax.transAxes, fontsize=12, color='gray')
+            ax.set_title(f"Thread States ({backend})")
+
+    # Add metadata as figure text
+    bench_filter = data.get("bench_filter", "")
+    duration = data.get("duration_s", 0)
+    limitations = data.get("limitations", [])
+    lim_text = "; ".join(limitations) if limitations else "none"
+    fig.text(0.5, -0.02,
+             f"Filter: {bench_filter}  |  Duration: {duration}s  |  Limitations: {lim_text}",
+             ha='center', fontsize=8, color='#666')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, "kernel_profile.png"), dpi=150, bbox_inches="tight")
+    plt.close()
+    print("  Saved kernel_profile.png")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -670,6 +950,8 @@ def main():
     plot_writer_heavy_mixed(run_dirs)
     plot_writer_heavy_latency(run_dirs)
     plot_contention_overview(run_dirs)
+    plot_lock_hold_breakdown(run_dirs)
+    plot_kernel_profile()
 
     print(f"\nAll plots saved to {OUTPUT_DIR}/")
 

@@ -38,6 +38,7 @@ test_helper = []
 bench = []
 fts = ["dep:tantivy"]
 codspeed = ["bench"]
+lock_metrics = []
 optimizer_params = ["serde", "dep:serde_json"]
 
 [target.'cfg(target_os = "linux")'.dependencies]

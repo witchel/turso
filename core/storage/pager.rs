@@ -1030,6 +1030,8 @@ struct CommitInfo {
     page_sources: Vec<PageSource>,
     page_source_cursor: usize,
     prepared_frames: Vec<PreparedFrames>,
+    #[cfg(feature = "lock_metrics")]
+    phase_start: Option<std::time::Instant>,
 }
 
 /// Represents a dirty page that will be committed to the log.
@@ -1048,6 +1050,10 @@ impl CommitInfo {
         self.page_sources.clear();
         self.prepared_frames.clear();
         self.page_source_cursor = 0;
+        #[cfg(feature = "lock_metrics")]
+        {
+            self.phase_start = None;
+        }
     }
 
     /// Clear and reserve space for n pages in each vector.
@@ -1368,6 +1374,8 @@ impl Pager {
                 prepared_frames: Vec::new(),
                 page_sources: Vec::new(),
                 page_source_cursor: 0,
+                #[cfg(feature = "lock_metrics")]
+                phase_start: None,
             }),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
@@ -3174,9 +3182,28 @@ impl Pager {
 
             match state {
                 CommitState::PrepareWal => {
+                    // Start timing the prepare phase (WAL header write + fsync)
+                    #[cfg(feature = "lock_metrics")]
+                    {
+                        let mut ci = self.commit_info.write();
+                        if ci.phase_start.is_none() {
+                            ci.phase_start = Some(std::time::Instant::now());
+                        }
+                    }
                     let page_sz = self.get_page_size_unchecked();
                     let c = wal.prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
+                        // No WAL header needed — record zero prepare time, start read phase
+                        #[cfg(feature = "lock_metrics")]
+                        {
+                            let mut ci = self.commit_info.write();
+                            if let Some(start) = ci.phase_start.take() {
+                                crate::lock_metrics::record_wal_commit_prepare_ns(
+                                    start.elapsed().as_nanos() as u64,
+                                );
+                            }
+                            ci.phase_start = Some(std::time::Instant::now());
+                        }
                         self.commit_info.write().state = CommitState::GetDbSize;
                         continue;
                     };
@@ -3187,6 +3214,17 @@ impl Pager {
                 }
                 CommitState::PrepareWalSync => {
                     let c = wal.prepare_wal_finish(self.get_sync_type())?;
+                    // Prepare phase done (header write + fsync), transition to read phase
+                    #[cfg(feature = "lock_metrics")]
+                    {
+                        let mut ci = self.commit_info.write();
+                        if let Some(start) = ci.phase_start.take() {
+                            crate::lock_metrics::record_wal_commit_prepare_ns(
+                                start.elapsed().as_nanos() as u64,
+                            );
+                        }
+                        ci.phase_start = Some(std::time::Instant::now());
+                    }
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
@@ -3229,6 +3267,16 @@ impl Pager {
                         drop(commit_info);
                         io_yield_one!(self.build_commit_completion_group());
                     }
+                    // Read phase done, transition to write phase
+                    #[cfg(feature = "lock_metrics")]
+                    {
+                        if let Some(start) = commit_info.phase_start.take() {
+                            crate::lock_metrics::record_wal_commit_read_ns(
+                                start.elapsed().as_nanos() as u64,
+                            );
+                        }
+                        commit_info.phase_start = Some(std::time::Instant::now());
+                    }
                     commit_info.state = CommitState::PrepareFrames { db_size };
                 }
                 CommitState::WaitBatchedReads { db_size } => {
@@ -3257,6 +3305,16 @@ impl Pager {
                     }
                     // All reads complete and successful, proceed to frame preparation
                     commit_info.completions.clear();
+                    // Read phase done, transition to write phase
+                    #[cfg(feature = "lock_metrics")]
+                    {
+                        if let Some(start) = commit_info.phase_start.take() {
+                            crate::lock_metrics::record_wal_commit_read_ns(
+                                start.elapsed().as_nanos() as u64,
+                            );
+                        }
+                        commit_info.phase_start = Some(std::time::Instant::now());
+                    }
                     commit_info.state = CommitState::PrepareFrames { db_size };
                 }
                 CommitState::PrepareFrames { db_size } => {
@@ -3342,12 +3400,25 @@ impl Pager {
                         .into());
                     }
                     commit_info.completions.clear();
+                    // Write phase done — record elapsed time
+                    #[cfg(feature = "lock_metrics")]
+                    {
+                        if let Some(start) = commit_info.phase_start.take() {
+                            crate::lock_metrics::record_wal_commit_write_ns(
+                                start.elapsed().as_nanos() as u64,
+                            );
+                        }
+                    }
                     // Writes done, submit fsync if needed.
                     // NORMAL mode skips fsync on WAL commit (but still fsyncs on checkpoint and wal restart).
                     if sync_mode == SyncMode::Full {
                         let sync_c = wal.sync(self.get_sync_type())?;
                         // Reuse the existing Vec instead of allocating a new one
                         commit_info.completions.push(sync_c);
+                        #[cfg(feature = "lock_metrics")]
+                        {
+                            commit_info.phase_start = Some(std::time::Instant::now());
+                        }
                         commit_info.state = CommitState::WaitSync;
                     } else {
                         commit_info.state = CommitState::WalCommitDone;
@@ -3381,6 +3452,15 @@ impl Pager {
                         return Err(std::io::Error::other("WAL fsync failed").into());
                     }
                     commit_info.completions.clear();
+                    // Sync phase done — record elapsed time
+                    #[cfg(feature = "lock_metrics")]
+                    {
+                        if let Some(start) = commit_info.phase_start.take() {
+                            crate::lock_metrics::record_wal_commit_sync_ns(
+                                start.elapsed().as_nanos() as u64,
+                            );
+                        }
+                    }
                     commit_info.state = CommitState::WalCommitDone;
                 }
                 CommitState::WalCommitDone => {

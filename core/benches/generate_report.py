@@ -2,6 +2,7 @@
 """Generate a self-contained HTML report with embedded benchmark graphs."""
 
 import base64
+import json
 import os
 from datetime import datetime
 
@@ -21,6 +22,121 @@ def img_tag(filename, alt):
     if not src:
         return f"<p><em>Plot not found: {filename}</em></p>"
     return f'<img src="{src}" alt="{alt}">'
+
+
+def kernel_profile_section():
+    """Generate the Kernel Profile HTML section from kernel_profile.json."""
+    json_path = os.path.join("target", "bench_retries", "kernel_profile.json")
+    if not os.path.exists(json_path):
+        return ""
+
+    with open(json_path) as f:
+        kdata = json.load(f)
+
+    backend = kdata.get("backend", "unknown")
+    platform = kdata.get("platform", "unknown")
+    bench_filter = kdata.get("bench_filter", "N/A")
+    duration = kdata.get("duration_s", 0)
+    errors = kdata.get("errors", [])
+    limitations = kdata.get("limitations", [])
+    trace_file = kdata.get("trace_file", "")
+
+    # Build metadata table rows
+    meta_rows = f"""
+<tr><td>Backend</td><td><code>{backend}</code></td></tr>
+<tr><td>Platform</td><td>{platform}</td></tr>
+<tr><td>Bench filter</td><td><code>{bench_filter}</code></td></tr>
+<tr><td>Duration</td><td>{duration}s</td></tr>"""
+
+    if trace_file:
+        meta_rows += f'\n<tr><td>Trace file</td><td><code>{trace_file}</code></td></tr>'
+
+    # Build limitations list
+    lim_html = ""
+    if limitations:
+        lim_items = "".join(f"<li>{lim}</li>" for lim in limitations)
+        lim_html = f"""
+<h3>Limitations</h3>
+<ul>{lim_items}</ul>"""
+
+    # Build errors list
+    err_html = ""
+    if errors:
+        err_items = "".join(f"<li>{err}</li>" for err in errors)
+        err_html = f"""
+<h3>Errors</h3>
+<ul style="color: #c0392b;">{err_items}</ul>"""
+
+    # Data availability explanation
+    avail_rows = ""
+    syscalls = kdata.get("syscalls")
+    thread_states = kdata.get("thread_states")
+    cpu_samples = kdata.get("cpu_samples")
+
+    has_syscalls = isinstance(syscalls, dict) and len(syscalls) > 0
+    has_thread = isinstance(thread_states, dict) and len(thread_states) > 0
+    has_cpu = isinstance(cpu_samples, dict) and cpu_samples.get("total_samples", 0) > 0
+
+    def check(val):
+        return "Available" if val else "Not available"
+
+    avail_rows = f"""
+<tr><td>Syscall timing</td><td>{check(has_syscalls)}</td></tr>
+<tr><td>Thread states</td><td>{check(has_thread)}</td></tr>
+<tr><td>CPU samples</td><td>{check(has_cpu)}</td></tr>"""
+
+    return f"""
+<!-- ===== Kernel Profile ===== -->
+<h2>6b. Kernel Profile</h2>
+
+<p>
+<strong>Purpose:</strong> Identify whether lock hold time is dominated by CPU work or
+kernel I/O (syscalls like fsync, pwrite). The kernel profiler runs the benchmark under
+a platform-specific tool (DTrace, perf, or Instruments) and extracts per-syscall timing
+and thread scheduling data.
+</p>
+
+<h3>Profiling Metadata</h3>
+<table class="hw-table">
+<tr><th>Property</th><th>Value</th></tr>
+{meta_rows}
+</table>
+
+<h3>Data Availability</h3>
+<table class="hw-table">
+<tr><th>Data Type</th><th>Status</th></tr>
+{avail_rows}
+</table>
+
+<p>
+Data availability depends on the backend and system permissions. On macOS with SIP enabled,
+DTrace can capture syscall timing but not thread scheduling states. The xctrace backend
+(Instruments System Trace) can provide thread states but not per-syscall timing.
+On Linux, <code>perf</code> can provide all three data types with sufficient permissions.
+</p>
+{lim_html}
+{err_html}
+
+<div class="graph">
+  {img_tag("kernel_profile.png", "Kernel Profile")}
+</div>
+
+<div class="findings">
+<strong>How to read this data:</strong>
+<ul>
+  <li><strong>Syscall breakdown</strong> (if available): Horizontal bars show total wall-clock time
+  spent in each syscall. The annotations show call count and average duration. Look for
+  <code>fsync</code>/<code>fdatasync</code> (durability cost) and
+  <code>pwrite64</code>/<code>pwritev</code> (write I/O cost) as these dominate under the
+  commit lock.</li>
+  <li><strong>Thread states</strong> (if available): Shows how much time benchmark threads spent
+  running vs blocked vs preempted. High blocked counts indicate I/O waits or lock contention
+  at the kernel level.</li>
+  <li>If neither chart is shown, open the trace file in Instruments.app (macOS) for
+  full thread-level analysis.</li>
+</ul>
+</div>
+"""
 
 html = f"""<!DOCTYPE html>
 <html lang="en">
@@ -276,8 +392,18 @@ the benchmark iteration. Error bars show &plusmn;1 stddev across 5 runs.
 <strong>Key findings:</strong>
 <ul>
   <li><strong>Turso WAL</strong> actually outperforms MVCC here. Since WAL serializes at the commit level, overlapping keys don't cause additional retries &mdash; the lock already prevents conflicts. WAL's simpler path wins when retries are expensive.</li>
-  <li><strong>Turso MVCC</strong> pays a retry penalty because overlapping keys trigger <code>WriteWriteConflict</code> at commit time, requiring full transaction rollback and re-execution of the 50-row batch.</li>
-  <li>This reveals an important design tradeoff: MVCC's optimistic approach wins for disjoint workloads but can lose to pessimistic locking when conflicts are frequent and transactions are large.</li>
+  <li><strong>Turso MVCC shows zero application-level retries</strong> despite 50% key overlap.
+  <code>INSERT OR REPLACE</code> eliminates data-level write-write conflicts (the row is
+  simply replaced, not conflicted). However, MVCC still contends internally on the
+  <code>pager_commit_lock</code> &mdash; lock metrics show tens of thousands of internal
+  try-lock failures that are handled transparently via I/O yielding without surfacing
+  as errors to the caller. This internal contention explains why MVCC throughput is
+  lower than WAL despite zero visible retries: time is spent spinning on the commit lock
+  rather than doing useful work.</li>
+  <li>This reveals an important design tradeoff: MVCC's optimistic approach avoids
+  application-visible retries for <code>OR REPLACE</code> workloads, but internal commit
+  lock contention still limits throughput. WAL's simpler pessimistic path wins here
+  because it avoids the commit lock spinning entirely.</li>
   <li><strong>SQLite</strong> continues to trail both Turso variants significantly.</li>
 </ul>
 </div>
@@ -395,8 +521,67 @@ matches the throughput plot above.
 </ul>
 </div>
 
+<!-- ===== Lock Hold Breakdown ===== -->
+<h2>6. Lock Hold Time Breakdown</h2>
+
+<p>
+<strong>Purpose:</strong> Decompose the lock hold time to answer two key questions:
+<em>"What fraction of lock hold time is disk I/O vs CPU work?"</em> and
+<em>"Which I/O operations dominate?"</em>
+This identifies whether optimization should target I/O reduction (group commit,
+deferred fsync) or CPU reduction (moving frame preparation outside the lock).
+This plot is only generated when benchmarks are run with <code>--features lock_metrics</code>.
+</p>
+
+<h3>Reading the Graph</h3>
+<p>
+<strong>Left panel (WAL):</strong> Five-segment stacked bars show per-acquisition lock hold time
+in microseconds. From bottom to top: non-I/O CPU work (lightest &mdash; frame preparation,
+page cache operations, commit finalization), WAL header prepare (WAL header pwrite + fsync),
+page reads (reading evicted pages from disk), frame pwritev (writing dirty page frames
+to the WAL file), and WAL fsync (final durability sync). The relative sizes immediately
+reveal whether the lock is I/O-bound or CPU-bound.
+</p>
+<p>
+<strong>Right panel (MVCC):</strong> Two-segment stacked bars showing <code>log_tx()</code>
+I/O (medium red) and <code>sync()</code>/fsync (dark red). These two operations account
+for &gt;99% of MVCC lock hold time; the remaining commit finalization overhead is &lt;1%
+and is omitted.
+</p>
+
+<div class="graph">
+  {img_tag("lock_hold_breakdown.png", "Lock Hold Time Breakdown")}
+</div>
+
+<div class="findings">
+<strong>Key findings:</strong>
+<ul>
+  <li><strong>WAL is CPU-bound under lock:</strong> Non-I/O CPU work (lightest green)
+  dominates at ~85% of hold time across all writer counts. The pwritev phase accounts
+  for only ~14%, and fsync is negligible (&lt;0.2%) because the benchmarks use
+  <code>SyncMode::Normal</code> which skips WAL-commit fsync. The CPU time is spent in
+  <code>WalCommitDone</code> finalization (frame cache updates via
+  <code>commit_prepared_frames</code>, dirty page clearing) and <code>PrepareFrames</code>
+  (frame header computation, page collection from cache).</li>
+  <li><strong>WAL optimization path:</strong> Since CPU work dominates, the primary
+  optimization target is moving frame preparation and commit finalization outside the
+  write_lock critical section, not reducing I/O. Moving I/O outside the lock would
+  only recover ~15% of hold time.</li>
+  <li><strong>MVCC is I/O-bound under lock:</strong> In contrast, MVCC lock hold time is
+  &gt;99% I/O &mdash; split roughly 70% fsync and 30% <code>log_tx()</code>. This makes MVCC
+  a good candidate for group commit or deferred fsync optimizations. With
+  <code>PRAGMA synchronous=NORMAL</code>, the fsync component would vanish entirely.</li>
+  <li><strong>Per-acquire cost at 12 writers:</strong> WAL holds the lock ~100&mu;s per
+  acquisition (83&mu;s CPU + 17&mu;s I/O). MVCC holds it ~70&mu;s per acquisition
+  (all I/O). MVCC&rsquo;s lower per-acquire time explains its higher throughput in
+  the Disjoint Key Scalability plot.</li>
+</ul>
+</div>
+
+{kernel_profile_section()}
+
 <!-- ===== Overview ===== -->
-<h2>6. Contention Overview</h2>
+<h2>7. Contention Overview</h2>
 
 <p>
 Side-by-side comparison of all contention levels at a fixed 8 writers, showing

@@ -13,13 +13,13 @@
 //! Run with: cargo bench --bench parallel_write_benchmark
 
 #[cfg(not(feature = "codspeed"))]
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 #[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{
-    BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+    criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -224,6 +224,27 @@ fn execute_rusqlite_with_retry(conn: &rusqlite::Connection, sql: &str, retries: 
 // Retry sidecar writer
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Lock metrics sidecar writer (only when lock_metrics feature is enabled)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "lock_metrics")]
+fn write_lock_metrics_sidecar(group: &str, variant: &str, param: usize) {
+    let snap = turso_core::lock_metrics::snapshot_and_reset();
+    let base = std::env::var("CARGO_MANIFEST_DIR")
+        .map(|d| {
+            std::path::PathBuf::from(d)
+                .parent()
+                .unwrap()
+                .join("target/bench_retries")
+        })
+        .unwrap_or_else(|_| std::path::PathBuf::from("target/bench_retries"));
+    let dir = base.join(group).join(variant);
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join(format!("{param}_lock_metrics.json"));
+    std::fs::write(path, snap.to_json()).ok();
+}
+
 fn write_retry_sidecar(group: &str, variant: &str, param: usize, count: u64) {
     // Write outside Criterion's directory to avoid being overwritten when
     // Criterion recreates the `new/` subdirectory for its own results.
@@ -376,6 +397,8 @@ fn bench_disjoint_scalability(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Disjoint Key Scalability", "turso_wal", writers);
                 }
                 total
             });
@@ -422,6 +445,8 @@ fn bench_disjoint_scalability(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Disjoint Key Scalability", "turso_mvcc", writers);
                 }
                 total
             });
@@ -543,6 +568,8 @@ fn bench_hot_row_contention(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Hot Row Contention", "turso_wal", writers);
                 }
                 total
             });
@@ -591,6 +618,8 @@ fn bench_hot_row_contention(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Hot Row Contention", "turso_mvcc", writers);
                 }
                 total
             });
@@ -709,6 +738,8 @@ fn bench_overlapping_insert(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Overlapping Key Insert", "turso_wal", writers);
                 }
                 total
             });
@@ -755,6 +786,8 @@ fn bench_overlapping_insert(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Overlapping Key Insert", "turso_mvcc", writers);
                 }
                 total
             });
@@ -874,6 +907,8 @@ fn bench_single_row_increment(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Single Row Increment", "turso_wal", writers);
                 }
                 total
             });
@@ -921,6 +956,8 @@ fn bench_single_row_increment(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Single Row Increment", "turso_mvcc", writers);
                 }
                 total
             });
@@ -1113,6 +1150,8 @@ fn bench_writer_heavy_mixed(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Writer Heavy Mixed", "turso_mvcc", writers);
                     let (wavg, wp99) = compute_latency_stats(&write_lats);
                     let (ravg, rp99) = compute_latency_stats(&read_lats);
                     write_latency_sidecar(
@@ -1208,6 +1247,8 @@ fn bench_writer_heavy_mixed(criterion: &mut Criterion) {
                         writers,
                         retries.load(Ordering::Relaxed),
                     );
+                    #[cfg(feature = "lock_metrics")]
+                    write_lock_metrics_sidecar("Writer Heavy Mixed", "turso_wal", writers);
                     let (wavg, wp99) = compute_latency_stats(&write_lats);
                     let (ravg, rp99) = compute_latency_stats(&read_lats);
                     write_latency_sidecar(

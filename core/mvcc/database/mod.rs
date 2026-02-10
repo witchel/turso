@@ -611,6 +611,9 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
     sync_mode: SyncMode,
     _phantom: PhantomData<Clock>,
+    /// Timestamp when pager_commit_lock was acquired (for hold-time measurement).
+    #[cfg(feature = "lock_metrics")]
+    lock_acquired_at: Option<std::time::Instant>,
 }
 
 impl<Clock: LogicalClock> Debug for CommitStateMachine<Clock> {
@@ -667,6 +670,8 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             header,
             sync_mode,
             _phantom: PhantomData,
+            #[cfg(feature = "lock_metrics")]
+            lock_acquired_at: None,
         }
     }
 }
@@ -911,12 +916,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     // logical log needs to be serialized
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
+                        #[cfg(feature = "lock_metrics")]
+                        crate::lock_metrics::record_mvcc_commit_lock_failure();
                         return Ok(TransitionResult::Io(IOCompletions::Single(
                             Completion::new_yield(),
                         )));
                     }
+                    #[cfg(feature = "lock_metrics")]
+                    {
+                        crate::lock_metrics::record_mvcc_commit_lock_acquire();
+                        self.lock_acquired_at = Some(std::time::Instant::now());
+                    }
                 }
+                #[cfg(feature = "lock_metrics")]
+                let log_start = std::time::Instant::now();
                 let c = mvcc_store.storage.log_tx(log_record)?;
+                #[cfg(feature = "lock_metrics")]
+                crate::lock_metrics::record_mvcc_commit_lock_log_ns(
+                    log_start.elapsed().as_nanos() as u64
+                );
                 self.state = CommitState::SyncLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
@@ -934,7 +952,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                     return Ok(TransitionResult::Continue);
                 }
+                #[cfg(feature = "lock_metrics")]
+                let sync_start = std::time::Instant::now();
                 let c = mvcc_store.storage.sync(self.pager.get_sync_type())?;
+                #[cfg(feature = "lock_metrics")]
+                crate::lock_metrics::record_mvcc_commit_lock_sync_ns(
+                    sync_start.elapsed().as_nanos() as u64,
+                );
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
@@ -957,6 +981,14 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let tx_unlocked = tx.value();
                 self.header.write().replace(*tx_unlocked.header.read());
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
+                #[cfg(feature = "lock_metrics")]
+                {
+                    if let Some(acquired) = self.lock_acquired_at.take() {
+                        crate::lock_metrics::record_mvcc_commit_lock_hold_ns(
+                            acquired.elapsed().as_nanos() as u64,
+                        );
+                    }
+                }
                 self.commit_coordinator.pager_commit_lock.unlock();
                 self.state = CommitState::CommitEnd { end_ts: *end_ts };
                 return Ok(TransitionResult::Continue);
