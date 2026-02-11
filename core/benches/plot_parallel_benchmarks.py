@@ -874,32 +874,66 @@ def plot_kernel_profile():
         ax = axes[panel_idx]
         panel_idx += 1
 
-        # Thread states may have different formats depending on backend
+        # Prefer _ms (duration) data from xctrace Python parser; fall back to _intervals
+        state_colors = {
+            "running": "#2ca02c",
+            "blocked": "#d62728",
+            "preempted": "#ff7f0e",
+            "runnable": "#1f77b4",
+            "interrupted": "#9467bd",
+        }
+        # Exclude "terminated" — it's just post-exit idle time per thread
+        exclude_states = {"terminated", "unknown"}
+
         state_keys = []
         state_values = []
+        state_intervals = []
+        bar_colors = []
+        use_ms = any(k.endswith("_ms") for k in thread_states)
 
-        for key in ["running_intervals", "blocked_intervals", "preempted_intervals"]:
-            if key in thread_states:
-                label = key.replace("_intervals", "").capitalize()
-                state_keys.append(label)
-                state_values.append(thread_states[key])
+        if use_ms:
+            # Rich data from xctrace Python parser
+            for key, val in thread_states.items():
+                if not key.endswith("_ms"):
+                    continue
+                state = key.replace("_ms", "")
+                if state in exclude_states:
+                    continue
+                state_keys.append(state.capitalize())
+                state_values.append(val)
+                state_intervals.append(thread_states.get(f"{state}_intervals", 0))
+                bar_colors.append(state_colors.get(state, "#888"))
+        else:
+            # Simple interval counts (perf backend or legacy)
+            for key in ["running_intervals", "blocked_intervals", "preempted_intervals"]:
+                if key in thread_states:
+                    label = key.replace("_intervals", "").capitalize()
+                    state_keys.append(label)
+                    state_values.append(thread_states[key])
+                    state_intervals.append(thread_states[key])
+                    bar_colors.append(state_colors.get(key.replace("_intervals", ""), "#888"))
 
-        # Also handle perf-style context_switches
-        if "context_switches" in thread_states and not state_keys:
-            state_keys.append("Context Switches")
-            state_values.append(thread_states["context_switches"])
+            # Also handle perf-style context_switches
+            if "context_switches" in thread_states and not state_keys:
+                state_keys.append("Context Switches")
+                state_values.append(thread_states["context_switches"])
+                state_intervals.append(thread_states["context_switches"])
+                bar_colors.append("#888")
 
         if state_keys:
-            colors = ["#2ca02c", "#d62728", "#ff7f0e", "#1f77b4"]
-            bars = ax.bar(state_keys, state_values,
-                          color=colors[:len(state_keys)], alpha=0.85)
+            bars = ax.bar(state_keys, state_values, color=bar_colors, alpha=0.85)
 
-            for bar, val in zip(bars, state_values):
+            for bar, val, intervals in zip(bars, state_values, state_intervals):
+                if use_ms:
+                    label = f"{val:,.0f} ms\n({intervals:,} intervals)"
+                else:
+                    label = f"{val:,}"
                 ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                        f"{val:,}", ha='center', va='bottom', fontsize=9)
+                        label, ha='center', va='bottom', fontsize=8)
 
-            ax.set_ylabel("Count")
-            ax.set_title(f"Thread State Intervals ({backend})")
+            ylabel = "Total Time (ms)" if use_ms else "Count"
+            ax.set_ylabel(ylabel)
+            ax.set_title(f"Thread State Duration ({backend})")
             ax.grid(True, alpha=0.3, axis="y")
         else:
             ax.text(0.5, 0.5, "No thread state data available",
